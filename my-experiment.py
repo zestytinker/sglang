@@ -1,3 +1,9 @@
+"""Goal: show that prefill is parallel and decode is sequential.
+
+Compares time to first token (prefill) and decode tok/s for a short and a
+~2,100-token prompt against a local SGLang server on port 30000.
+"""
+
 import time
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="none")
