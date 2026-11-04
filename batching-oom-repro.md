@@ -1,8 +1,9 @@
 # MLX backend: Metal OOM when admitting a batch of new requests
 
 On an Apple M2 (16 GB), the SGLang server crashes with a Metal out-of-memory error
-when many concurrent requests are admitted at once. The KV cache is almost empty at
-the time. Capping the KV pool with `--max-total-tokens` avoids the crash.
+when 12 or more new requests are admitted at once. The KV cache is almost empty at
+the time. Capping the KV pool with `--max-total-tokens` avoided the crash once but
+not reliably. The root cause is not yet known.
 
 Possibly related upstream issue: https://github.com/sgl-project/sglang/issues/39675
 (not confirmed to be the same root cause).
@@ -42,12 +43,15 @@ Possibly related upstream issue: https://github.com/sgl-project/sglang/issues/39
 |---|---|---|---|---|
 | A | 8.65 GB | 6.01 GB (56,232 slots) | none | crash |
 | B | 8.11 GB | 5.63 GB (52,698 slots) | `--max-running-requests 8` | crash |
-| C | 9.21 GB | 2.19 GB (20,000 slots) | `--max-total-tokens 20000` | OK, 294.5 tok/s total |
+| C | 9.21 GB | 2.19 GB (20,000 slots) | `--max-total-tokens 20000` | OK, 294.5 tok/s total (batch 16 only, 100 tokens) |
+| D | 7.41 GB | 2.19 GB (20,000 slots) | `--max-total-tokens 20000` | crash (full sweep 1 to 16, 200 tokens) |
 
-- KV usage was near zero at the crash: `token usage: 0.00` (run A) and `0.01` (run B).
-- Both crashes happen in the prefill (extend) step that admits queued requests:
-  run A right after `#queue-req: 13`, run B with `#running-req: 8, #queue-req: 8`.
-- Limiting concurrency to 8 (run B) did not help; limiting the KV pool size (run C) did.
+- KV usage was near zero at every crash (`token usage` 0.00 to 0.01).
+- Every crash happens in the prefill (extend) step that admits queued requests:
+  run A with `#queue-req: 13`, run B with `#queue-req: 8`, run D with `#queue-req: 12`.
+- The new requests carried very few new tokens (run D: 4 new tokens, 76 cached),
+  so memory use does not seem to follow token count.
+- Neither limiting concurrency (run B) nor limiting the KV pool (run D) prevents it.
 
 Startup log line showing the auto-sizing (run A):
 
@@ -71,16 +75,21 @@ Scheduler hit an exception: Traceback (most recent call last):
 RuntimeError: [METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory).
 ```
 
-## Likely cause (hypothesis)
+## Possible cause (unconfirmed)
 
-The KV pool is sized to about 70% of the memory free at startup. When more memory
-is free, the pool grows to 5-6 GB, which leaves too little headroom on a 16 GB
-machine for the temporary buffers of a multi-request prefill. Earlier the same day,
-with 3.8 GB free, the pool was 2.66 GB.
+A large auto-sized KV pool (5-6 GB) was the first suspect, but run D crashed with
+the pool capped at 2.2 GB, so pool size alone does not explain it.
 
-## Workaround
+A lead from reading the code: `_async_extend_batch` in
+`python/sglang/srt/hardware_backend/mlx/tp_worker.py` calls `prefill_start`
+separately for each new request, each with its own cache object, and evaluates them
+all in one `mx.async_eval`. That would make peak memory grow with the number of
+requests admitted together rather than with token count. Not yet verified.
 
-Cap the KV pool explicitly:
+## Mitigation
+
+No reliable workaround yet. Batch sizes up to 8 completed in every run.
+Capping the KV pool may lower the risk:
 
 ```bash
 SGLANG_USE_MLX=1 python -m sglang.launch_server --model-path mlx-community/Qwen3-0.6B-4bit --disable-cuda-graph --max-total-tokens 20000
